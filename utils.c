@@ -293,3 +293,20 @@ double realtime()
 	gettimeofday(&tp, &tzp);
 	return tp.tv_sec + tp.tv_usec * 1e-6;
 }
+
+int is_daemon_running(){
+	int fd = open(DAEMON_LOCK,
+	    O_CREAT | //create the file if it's not present.
+	    O_WRONLY,//only need write access for the internal locking semantics.
+	    S_IRUSR | S_IWUSR); //permissions on the file, 600 here.
+
+	if (fd == -1) {
+	    return 1;
+	}
+	else if(flock(fd, LOCK_EX|LOCK_NB) == -1){
+		return 1;
+	}
+	else{
+		return 0;
+	}
+}

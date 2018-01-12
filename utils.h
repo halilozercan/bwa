@@ -31,6 +31,13 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <zlib.h>
+#include <unistd.h>
+
+// For unix sockets while using daemon
+#include <sys/types.h>
+#include <sys/socket.h>
+#include <sys/un.h>
+#include <sys/file.h>
 
 #ifdef __GNUC__
 // Tell GCC to validate printf format string and args
@@ -38,6 +45,17 @@
 #else
 #define ATTRIBUTE(list)
 #endif
+
+#define SOCK_PATH "/tmp/bwa.socket"
+#define DAEMON_LOCK "/tmp/.bwalock"
+/* Exit Codes */
+#define EXIT_SUCCESS 0
+#define EXIT_COMMON 1
+#define EXIT_MAXBAMS 2
+#define EXIT_PARAM_ERROR 3
+#define EXIT_EXTERNAL_PROG_ERROR 4
+#define EXIT_FILE_OPEN_ERROR 5
+#define EXIT_READGROUP 6
 
 #define err_fatal_simple(msg) _err_fatal_simple(__func__, msg)
 #define err_fatal_simple_core(msg) _err_fatal_simple_core(__func__, msg)
@@ -58,6 +76,8 @@ typedef struct { size_t n, m; pair64_t *a; } pair64_v;
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+	int is_daemon_running();
 
 	void err_fatal(const char *header, const char *fmt, ...) ATTRIBUTE((noreturn));
 	void err_fatal_core(const char *header, const char *fmt, ...) ATTRIBUTE((noreturn));

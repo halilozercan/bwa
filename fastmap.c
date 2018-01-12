@@ -6,6 +6,7 @@
 #include <limits.h>
 #include <ctype.h>
 #include <math.h>
+#include <time.h>
 #include "bwa.h"
 #include "bwamem.h"
 #include "kvec.h"
@@ -112,6 +113,171 @@ static void update_a(mem_opt_t *opt, const mem_opt_t *opt0)
 	}
 }
 
+void switch_stdio(FILE * stream, const char * file_path){
+	fflush(stream);
+	freopen(file_path, "a+", stream);
+	setlinebuf(stream);
+}
+
+char * get_datetime(){
+	time_t     now;
+    struct tm  ts;
+    char * buf = (char*)malloc(sizeof(char)*200);
+    // Get current time
+    time(&now);
+    // Format time, "ddd yyyy-mm-dd hh:mm:ss zzz"
+    ts = *localtime(&now);
+    strftime(buf, sizeof(buf), "%a %Y-%m-%d %H:%M:%S %Z", &ts);
+    return buf;
+}
+
+void init_server(char *reference, mem_opt_t *opt){
+	int fd, fd2, i, c, ignore_alt = 0, no_mt_io = 0;
+	int fixed_chunk_size = -1;
+	gzFile fp, fp2 = 0;
+	char *p, *rg_line = 0, *hdr_line = 0;
+	const char *mode = 0;
+	void *ko = 0, *ko2 = 0;
+	mem_pestat_t pes[4];
+	ktp_aux_t aux;
+
+	unsigned int s, s2;
+	struct sockaddr_un local, remote;
+	int len;
+
+	if((s = socket(AF_UNIX, SOCK_STREAM, 0)) == -1){
+		perror("socket");
+		exit(EXIT_FAILURE);
+	}
+
+	local.sun_family = AF_UNIX;  /* local is declared before socket() ^ */
+	strcpy(local.sun_path, SOCK_PATH);
+	unlink(local.sun_path);
+	len = strlen(local.sun_path) + sizeof(local.sun_family);
+	bind(s, (struct sockaddr *)&local, len);
+
+	if( listen(s, 5) == -1){
+		perror("listen");
+		exit(EXIT_FAILURE);
+	}
+
+	fprintf(stdout, "Started BWA MEM in daemon mode\n");
+
+	char * datetime = get_datetime();
+	fprintf(stdout, "STARTED bwa mem daemon: %s\n", datetime);
+	fprintf(stdout, "Loading reference genome\n");
+
+	free(datetime);
+
+	fprintf(stdout, "%s\n", reference);
+	aux.idx = bwa_idx_load_from_shm(reference);
+	if (aux.idx == 0) {
+		if ((aux.idx = bwa_idx_load(reference, BWA_IDX_ALL)) == 0) return 1; // FIXME: memory leak
+	}
+
+	daemon(0,1);
+	/* Redirect STDIO to a log file*/
+	switch_stdio(stdout, "/tmp/out_bwamem.log");
+	switch_stdio(stderr, "/tmp/err_bwamem.log");
+
+	while(1){
+		len = sizeof(struct sockaddr_un);
+		fprintf(stdout, "Waiting for connection\n");
+		s2 = accept(s, &remote, &len);
+
+		recv(s2, &len, sizeof(int), 0);
+		char read1[len];
+		recv(s2, read1, len, 0);
+
+		recv(s2, &len, sizeof(int), 0);
+		char read2[len];
+		recv(s2, read2, len, 0);
+
+		ko = kopen(read1, &fd);
+		if (ko == 0) {
+			if (bwa_verbose >= 1) fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __func__, read1);
+			return 1;
+		}
+		fp = gzdopen(fd, "r");
+		aux.ks = kseq_init(fp);
+		
+		ko2 = kopen(read2, &fd2);
+		if (ko2 == 0) {
+			if (bwa_verbose >= 1) fprintf(stderr, "[E::%s] fail to open file `%s'.\n", __func__, read2);
+			return 1;
+		}
+		fp2 = gzdopen(fd2, "r");
+		aux.ks2 = kseq_init(fp2);
+		opt->flag |= MEM_F_PE;
+
+		bwa_print_sam_hdr(aux.idx->bns, hdr_line);
+		aux.actual_chunk_size = fixed_chunk_size > 0? fixed_chunk_size : opt->chunk_size * opt->n_threads;
+		kt_pipeline(no_mt_io? 1 : 2, process, &aux, 3);
+		free(hdr_line);
+		free(opt);
+		bwa_idx_destroy(aux.idx);
+		kseq_destroy(aux.ks);
+		err_gzclose(fp); kclose(ko);
+		if (aux.ks2) {
+			kseq_destroy(aux.ks2);
+			err_gzclose(fp2); kclose(ko2);
+		}
+		int result = 0;
+		send(s2, &(result), sizeof(int), 0);
+	}
+	return 0;
+}
+
+
+void init_client(mem_opt_t *opt, char** argv){
+	unsigned int s;
+	struct sockaddr_un local, remote;
+	int len;
+
+	if ((s = socket(AF_UNIX, SOCK_STREAM, 0)) == -1) {
+		perror("socket");
+		exit(1);
+	}
+
+	remote.sun_family = AF_UNIX;
+	strcpy(remote.sun_path, SOCK_PATH);
+	len = strlen(remote.sun_path) + sizeof(remote.sun_family);
+	if (connect(s, (struct sockaddr *)&remote, len) == -1) {
+		perror("connect");
+		exit(1);
+	}
+
+	len = strlen(argv[optind+1]);
+
+	if (send(s, &len, sizeof(int), 0) == -1) {
+		perror("send");
+		exit(1);
+	}
+
+	if (send(s, argv[optind+1], sizeof(char)*len, 0) == -1) {
+		perror("send");
+		exit(1);
+	}
+
+	len = strlen(argv[optind+2]);
+
+	if (send(s, &len, sizeof(int), 0) == -1) {
+		perror("send");
+		exit(1);
+	}
+
+	if (send(s, argv[optind+2], sizeof(char)*len, 0) == -1) {
+		perror("send");
+		exit(1);
+	}
+
+	int result;
+	recv(s, &(result), sizeof(int), 0);
+	printf("Returned result: %d\n", result);
+
+	close(s);
+}
+
 int main_mem(int argc, char *argv[])
 {
 	mem_opt_t *opt, opt0;
@@ -130,7 +296,7 @@ int main_mem(int argc, char *argv[])
 
 	aux.opt = opt = mem_opt_init();
 	memset(&opt0, 0, sizeof(mem_opt_t));
-	while ((c = getopt(argc, argv, "51qpaMCSPVYjk:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:o:f:W:x:G:h:y:K:X:H:")) >= 0) {
+	while ((c = getopt(argc, argv, "51qpaMCSPVYjkb:c:v:s:r:t:R:A:B:O:E:U:w:L:d:T:Q:D:m:I:N:o:f:W:x:G:h:y:K:X:H:")) >= 0) {
 		if (c == 'k') opt->min_seed_len = atoi(optarg), opt0.min_seed_len = 1;
 		else if (c == '1') no_mt_io = 1;
 		else if (c == 'x') mode = optarg;
@@ -149,6 +315,7 @@ int main_mem(int argc, char *argv[])
 		else if (c == 'V') opt->flag |= MEM_F_REF_HDR;
 		else if (c == '5') opt->flag |= MEM_F_PRIMARY5 | MEM_F_KEEP_SUPP_MAPQ; // always apply MEM_F_KEEP_SUPP_MAPQ with -5
 		else if (c == 'q') opt->flag |= MEM_F_KEEP_SUPP_MAPQ;
+		else if (c == 'b') opt->flag |= MEM_F_DAEMON;
 		else if (c == 'c') opt->max_occ = atoi(optarg), opt0.max_occ = 1;
 		else if (c == 'd') opt->zdrop = atoi(optarg), opt0.zdrop = 1;
 		else if (c == 'v') bwa_verbose = atoi(optarg);
@@ -235,7 +402,7 @@ int main_mem(int argc, char *argv[])
 	}
 
 	if (opt->n_threads < 1) opt->n_threads = 1;
-	if (optind + 1 >= argc || optind + 3 < argc) {
+	if (!(opt->flag & MEM_F_DAEMON) && (optind + 1 >= argc || optind + 3 < argc)) {
 		fprintf(stderr, "\n");
 		fprintf(stderr, "Usage: bwa mem [options] <idxbase> <in1.fq> [in2.fq]\n\n");
 		fprintf(stderr, "Algorithm options:\n\n");
@@ -323,6 +490,27 @@ int main_mem(int argc, char *argv[])
 		}
 	} else update_a(opt, &opt0);
 	bwa_fill_scmat(opt->a, opt->b, opt->mat);
+
+	if(opt->flag & MEM_F_DAEMON){
+		// Daemon mode activated. Either start the daemon or send a task to daemon
+		if(is_daemon_running()){
+			// A progress is already running. Send request to there.
+			fprintf(stdout, "bwa mem daemon is already runnning. Initialized in client mode.\n");
+			if (optind + 1 >= argc || optind + 3 < argc)
+			{
+				fprintf( stderr, "[BWAMEM CMDLINE ERROR] Not enough arguments.\n");
+				exit(EXIT_PARAM_ERROR);
+			}
+			init_client(opt, argv);
+		}
+		else{
+			// Daemon is started for first time.
+			// Go into daemon mode and then start working on current request.
+			fprintf(stdout, "bwa mem daemon is not present. Initialized in server mode.\n");
+			init_server(argv[optind-1], opt);
+		}
+		exit(EXIT_SUCCESS);
+	}
 
 	aux.idx = bwa_idx_load_from_shm(argv[optind]);
 	if (aux.idx == 0) {
