@@ -131,15 +131,14 @@ char * get_datetime(){
     return buf;
 }
 
-void init_server(char *reference, mem_opt_t *opt){
-	int fd, fd2, i, c, ignore_alt = 0, no_mt_io = 0;
+void init_server(ktp_aux_t aux, int no_mt_io, char *reference, mem_opt_t *opt){
+	int fd, fd2, i, c, ignore_alt = 0;
 	int fixed_chunk_size = -1;
 	gzFile fp, fp2 = 0;
 	char *p, *rg_line = 0, *hdr_line = 0;
 	const char *mode = 0;
 	void *ko = 0, *ko2 = 0;
 	mem_pestat_t pes[4];
-	ktp_aux_t aux;
 
 	unsigned int s, s2;
 	struct sockaddr_un local, remote;
@@ -176,22 +175,23 @@ void init_server(char *reference, mem_opt_t *opt){
 	}
 
 	daemon(0,1);
-	/* Redirect STDIO to a log file*/
-	switch_stdio(stdout, "/tmp/out_bwamem.log");
-	switch_stdio(stderr, "/tmp/err_bwamem.log");
 
 	while(1){
+		/* Redirect STDIO to a log file*/
+		switch_stdio(stdout, "/tmp/out_bwamem.log");
+		switch_stdio(stderr, "/tmp/err_bwamem.log");
+
 		len = sizeof(struct sockaddr_un);
 		fprintf(stdout, "Waiting for connection\n");
 		s2 = accept(s, &remote, &len);
 
 		recv(s2, &len, sizeof(int), 0);
-		char read1[len];
-		recv(s2, read1, len, 0);
+		char read1[len+1];
+		recv(s2, read1, len, 0); read1[len]='\0';
 
 		recv(s2, &len, sizeof(int), 0);
-		char read2[len];
-		recv(s2, read2, len, 0);
+		char read2[len+1];
+		recv(s2, read2, len, 0); read2[len]='\0';
 
 		ko = kopen(read1, &fd);
 		if (ko == 0) {
@@ -210,26 +210,32 @@ void init_server(char *reference, mem_opt_t *opt){
 		aux.ks2 = kseq_init(fp2);
 		opt->flag |= MEM_F_PE;
 
+		dup2(s2, 1); // Redirect stdout to socket
 		bwa_print_sam_hdr(aux.idx->bns, hdr_line);
 		aux.actual_chunk_size = fixed_chunk_size > 0? fixed_chunk_size : opt->chunk_size * opt->n_threads;
 		kt_pipeline(no_mt_io? 1 : 2, process, &aux, 3);
-		free(hdr_line);
-		free(opt);
-		bwa_idx_destroy(aux.idx);
 		kseq_destroy(aux.ks);
 		err_gzclose(fp); kclose(ko);
 		if (aux.ks2) {
 			kseq_destroy(aux.ks2);
 			err_gzclose(fp2); kclose(ko2);
 		}
-		int result = 0;
-		send(s2, &(result), sizeof(int), 0);
+		char eof = '\0';
+		send(s2, &(eof), sizeof(char), 0);
 	}
 	return 0;
 }
 
 
-void init_client(mem_opt_t *opt, char** argv){
+int main_memc(int argc, char* argv[]){
+	if(!is_daemon_running()) {
+		fprintf(stderr, "Cannot find bwa mem in daemon mode. Failed to start!\n");
+		exit(1);
+	}
+	if(argc != 3) {
+		fprintf(stderr, "Wrong number of arguments!\n");
+		exit(1);
+	}
 	unsigned int s;
 	struct sockaddr_un local, remote;
 	int len;
@@ -247,33 +253,38 @@ void init_client(mem_opt_t *opt, char** argv){
 		exit(1);
 	}
 
-	len = strlen(argv[optind+1]);
+	len = strlen(argv[1]);
 
 	if (send(s, &len, sizeof(int), 0) == -1) {
 		perror("send");
 		exit(1);
 	}
 
-	if (send(s, argv[optind+1], sizeof(char)*len, 0) == -1) {
+	if (send(s, argv[1], sizeof(char)*len, 0) == -1) {
 		perror("send");
 		exit(1);
 	}
 
-	len = strlen(argv[optind+2]);
+	len = strlen(argv[2]);
 
 	if (send(s, &len, sizeof(int), 0) == -1) {
 		perror("send");
 		exit(1);
 	}
 
-	if (send(s, argv[optind+2], sizeof(char)*len, 0) == -1) {
+	if (send(s, argv[2], sizeof(char)*len, 0) == -1) {
 		perror("send");
 		exit(1);
 	}
 
-	int result;
-	recv(s, &(result), sizeof(int), 0);
-	printf("Returned result: %d\n", result);
+	while(1) {
+		char buf[1024];
+		int received = recv(s, &(buf), sizeof(char)*1024, 0);
+		fwrite (buf , sizeof(char), received, stdout);
+		if(buf[received-1] == '\0') {
+			break;
+		}
+	}
 
 	close(s);
 }
@@ -447,6 +458,7 @@ int main_mem(int argc, char *argv[])
 		fprintf(stderr, "       -C            append FASTA/FASTQ comment to SAM output\n");
 		fprintf(stderr, "       -V            output the reference FASTA header in the XR tag\n");
 		fprintf(stderr, "       -Y            use soft clipping for supplementary alignments\n");
+		fprintf(stderr, "       -b            initialize in daemon mode, read files are not necessary.\n");
 		fprintf(stderr, "       -M            mark shorter split hits as secondary\n\n");
 		fprintf(stderr, "       -I FLOAT[,FLOAT[,INT[,INT]]]\n");
 		fprintf(stderr, "                     specify the mean, standard deviation (10%% of the mean if absent), max\n");
@@ -495,19 +507,14 @@ int main_mem(int argc, char *argv[])
 		// Daemon mode activated. Either start the daemon or send a task to daemon
 		if(is_daemon_running()){
 			// A progress is already running. Send request to there.
-			fprintf(stdout, "bwa mem daemon is already runnning. Initialized in client mode.\n");
-			if (optind + 1 >= argc || optind + 3 < argc)
-			{
-				fprintf( stderr, "[BWAMEM CMDLINE ERROR] Not enough arguments.\n");
-				exit(EXIT_PARAM_ERROR);
-			}
-			init_client(opt, argv);
+			fprintf(stderr, "bwa mem daemon is already runnning!\n");
+			exit(EXIT_PARAM_ERROR);
 		}
 		else{
 			// Daemon is started for first time.
 			// Go into daemon mode and then start working on current request.
-			fprintf(stdout, "bwa mem daemon is not present. Initialized in server mode.\n");
-			init_server(argv[optind-1], opt);
+			fprintf(stderr, "Starting bwa mem daemon.\n");
+			init_server(aux, no_mt_io, argv[optind-1], opt);
 		}
 		exit(EXIT_SUCCESS);
 	}

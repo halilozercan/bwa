@@ -22,6 +22,7 @@ int bwa_bwtsw2(int argc, char *argv[]);
 
 int main_fastmap(int argc, char *argv[]);
 int main_mem(int argc, char *argv[]);
+int main_memc(int argc, char *argv[]);
 int main_shm(int argc, char *argv[]);
 
 int main_pemerge(int argc, char *argv[]);
@@ -83,6 +84,7 @@ int main(int argc, char *argv[])
 	else if (strcmp(argv[1], "bwasw") == 0) ret = bwa_bwtsw2(argc-1, argv+1);
 	else if (strcmp(argv[1], "fastmap") == 0) ret = main_fastmap(argc-1, argv+1);
 	else if (strcmp(argv[1], "mem") == 0) ret = main_mem(argc-1, argv+1);
+	else if (strcmp(argv[1], "memc") == 0) ret = main_memc(argc-1, argv+1);
 	else if (strcmp(argv[1], "shm") == 0) ret = main_shm(argc-1, argv+1);
 	else if (strcmp(argv[1], "pemerge") == 0) ret = main_pemerge(argc-1, argv+1);
 	else if (strcmp(argv[1], "maxk") == 0) ret = main_maxk(argc-1, argv+1);
